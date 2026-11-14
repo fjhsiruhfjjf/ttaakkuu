@@ -29,6 +29,7 @@
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
 import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore.js";
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js";
 import { getStorage, ref as storageRef, uploadString, getDownloadURL } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-storage.js";
 
 var firebaseConfig = {
@@ -42,6 +43,8 @@ var firebaseConfig = {
 var fbApp = initializeApp(firebaseConfig);
 var db = getFirestore(fbApp);
 var storage = getStorage(fbApp);
+var auth = getAuth(fbApp);
+var staffCol = collection(db, "staff");
 var propertiesCol = collection(db, "properties");
 
 function uploadPhotos(itemId, photos) {
@@ -89,8 +92,6 @@ var PRIORITIES = [
 var STATUS_OPTIONS = ["更地", "建設中", "解体中", "内装中", "空室", "交渉中", "その他"];
 var TYPE_OPTIONS = ["新規地", "跡地", "不明"];
 var STORAGE_KEY = "daybreak_properties";
-var AUTH_KEY = "daybreak_auth";
-var APP_PASSWORD = "day9000";
 
 function toHalfWidth(str) {
   str = str || "";
@@ -149,7 +150,7 @@ async function geocodeAddress(address) {
   return { error: lastError };
 }
 function emptyForm() {
-  return { name: "", address: "", priority: "普通", status: "更地", statusOther: "", type: "不明", memo: "", photos: [] };
+  return { name: "", address: "", priority: "普通", status: "更地", statusOther: "", type: "不明", staff: "", memo: "", photos: [] };
 }
 function resizeImage(file) {
   return new Promise(function(resolve, reject) {
@@ -196,9 +197,16 @@ function saveJson(key, val) {
 }
 
 function PropertyTracker() {
-  var lockedState = useState(true); var locked = lockedState[0], setLocked = lockedState[1];
+  var userState = useState(undefined); var user = userState[0], setUser = userState[1];
+  var emailState = useState(""); var emailInput = emailState[0], setEmailInput = emailState[1];
   var pwState = useState(""); var pwInput = pwState[0], setPwInput = pwState[1];
-  var pwErrState = useState(false); var pwError = pwErrState[0], setPwError = pwErrState[1];
+  var authErrState = useState(""); var authError = authErrState[0], setAuthError = authErrState[1];
+  var authBusyState = useState(false); var authBusy = authBusyState[0], setAuthBusy = authBusyState[1];
+  var adminEmailState = useState(""); var adminEmail = adminEmailState[0], setAdminEmail = adminEmailState[1];
+  var staffListState = useState([]); var staffList = staffListState[0], setStaffList = staffListState[1];
+  var staffFilterState = useState(new Set()); var staffFilter = staffFilterState[0], setStaffFilter = staffFilterState[1];
+  var adminOpenState = useState(false); var adminOpen = adminOpenState[0], setAdminOpen = adminOpenState[1];
+  var newStaffState = useState(""); var newStaff = newStaffState[0], setNewStaff = newStaffState[1];
   var itemsState = useState([]); var items = itemsState[0], setItems = itemsState[1];
   var queryState = useState(""); var query = queryState[0], setQuery = queryState[1];
   var priFilterState = useState(new Set()); var priorityFilter = priFilterState[0], setPriorityFilter = priFilterState[1];
@@ -220,8 +228,13 @@ function PropertyTracker() {
   var markerLayerRef = useRef(null);
 
   useEffect(function() {
-    if (loadJson(AUTH_KEY) === "ok") setLocked(false);
-    var unsub = onSnapshot(propertiesCol, function(snapshot) {
+    return onAuthStateChanged(auth, function(u) { setUser(u || null); });
+  }, []);
+
+  useEffect(function() {
+    if (!user) { setItems([]); setStaffList([]); setAdminEmail(""); return; }
+    var unsubs = [];
+    unsubs.push(onSnapshot(propertiesCol, function(snapshot) {
       var list = [];
       snapshot.forEach(function(docSnap) {
         list.push(Object.assign({ id: docSnap.id }, docSnap.data()));
@@ -229,9 +242,24 @@ function PropertyTracker() {
       setItems(list);
     }, function(err) {
       showToast("データベースへの接続に失敗しました");
-    });
-    return unsub;
-  }, []);
+    }));
+    unsubs.push(onSnapshot(staffCol, function(snapshot) {
+      var list = [];
+      snapshot.forEach(function(docSnap) {
+        var d = docSnap.data();
+        list.push({ id: docSnap.id, name: d.name || "", createdAt: d.createdAt || 0 });
+      });
+      list.sort(function(a, b){ return a.createdAt - b.createdAt; });
+      setStaffList(list);
+    }, function(err) {}));
+    unsubs.push(onSnapshot(doc(db, "config", "admin"), function(snap) {
+      setAdminEmail(snap.exists() ? String(snap.data().email || "") : "");
+    }, function(err) {}));
+    return function() { unsubs.forEach(function(f){ f(); }); };
+  }, [user]);
+
+  var isAdmin = !!(user && user.email && adminEmail && user.email.toLowerCase() === adminEmail.trim().toLowerCase());
+
 
   useEffect(function() {
     if (!mapOpen) return;
@@ -318,14 +346,37 @@ function PropertyTracker() {
     setToast(msg);
     setTimeout(function(){ setToast(""); }, 2200);
   }
-  function submitPassword() {
-    if (pwInput === APP_PASSWORD) {
-      setLocked(false);
-      setPwError(false);
-      saveJson(AUTH_KEY, "ok");
-    } else {
-      setPwError(true);
-    }
+  function submitLogin() {
+    if (!emailInput.trim() || !pwInput) { setAuthError("メールアドレスとパスワードを入力してください"); return; }
+    setAuthBusy(true); setAuthError("");
+    signInWithEmailAndPassword(auth, emailInput.trim(), pwInput).then(function() {
+      setAuthBusy(false); setPwInput("");
+    }).catch(function(err) {
+      setAuthBusy(false);
+      var c = err && err.code || "";
+      if (c === "auth/network-request-failed") setAuthError("通信エラーです。電波を確認してください");
+      else if (c === "auth/too-many-requests") setAuthError("試行回数が多すぎます。しばらく待ってください");
+      else setAuthError("メールアドレスまたはパスワードが違います");
+    });
+  }
+  function doLogout() {
+    if (!window.confirm("ログアウトしますか？")) return;
+    signOut(auth);
+  }
+  function addStaff() {
+    var n = newStaff.trim();
+    if (!n) return;
+    if (staffList.some(function(s){ return s.name === n; })) { showToast("同じ名前が登録済みです"); return; }
+    setDoc(doc(staffCol, uid()), { name: n, createdAt: Date.now() }).then(function(){ setNewStaff(""); showToast("追加しました"); }).catch(function(){ showToast("追加できませんでした（管理者のみ）"); });
+  }
+  function removeStaff(s) {
+    if (!window.confirm("「" + s.name + "」を削除しますか？\n（物件に入力済みの担当者名は残ります）")) return;
+    deleteDoc(doc(staffCol, s.id)).catch(function(){ showToast("削除できませんでした（管理者のみ）"); });
+  }
+  function toggleStaffFilter(key) {
+    var next = new Set(staffFilter);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    setStaffFilter(next);
   }
 
   var filtered = useMemo(function() {
@@ -333,8 +384,9 @@ function PropertyTracker() {
     return items.filter(function(it) {
       if (priorityFilter.size && !priorityFilter.has(it.priority)) return false;
       if (statusFilter.size && !statusFilter.has(it.status)) return false;
+      if (staffFilter.size && !staffFilter.has(it.staff || "__none__")) return false;
       if (!tokens.length) return true;
-      var hay = toHalfWidth(it.name + " " + it.address + " " + it.status + " " + it.type + " " + it.memo).toLowerCase();
+      var hay = toHalfWidth(it.name + " " + it.address + " " + it.status + " " + it.type + " " + (it.staff || "") + " " + it.memo).toLowerCase();
       return tokens.every(function(t){ return hay.includes(t.toLowerCase()); });
     }).sort(function(a, b) {
       var order = { "最優先": 0, "優先": 1, "普通": 2, "保留": 3 };
@@ -343,7 +395,7 @@ function PropertyTracker() {
       if (oa !== ob) return oa - ob;
       return (b.createdAt || 0) - (a.createdAt || 0);
     });
-  }, [items, query, priorityFilter, statusFilter]);
+  }, [items, query, priorityFilter, statusFilter, staffFilter]);
 
   function togglePriorityFilter(key) {
     var next = new Set(priorityFilter);
@@ -366,7 +418,7 @@ function PropertyTracker() {
       name: it.name, address: it.address, priority: it.priority,
       status: STATUS_OPTIONS.includes(it.status) ? it.status : "その他",
       statusOther: STATUS_OPTIONS.includes(it.status) ? "" : it.status,
-      type: it.type || "不明", memo: it.memo || "", photos: it.photos || [],
+      type: it.type || "不明", staff: it.staff || "", memo: it.memo || "", photos: it.photos || [],
     });
     setEditingId(it.id);
     setFormOpen(true);
@@ -390,9 +442,9 @@ function PropertyTracker() {
     uploadPhotos(targetId, form.photos || []).then(function(uploadedPhotos) {
       if (editingId) {
         var existing = items.find(function(it){ return it.id === editingId; }) || {};
-        saveItemDoc(editingId, Object.assign({}, existing, { name: form.name.trim(), address: form.address.trim(), priority: form.priority, status: statusValue, type: form.type, memo: form.memo.trim(), photos: uploadedPhotos, updatedAt: Date.now() }));
+        saveItemDoc(editingId, Object.assign({}, existing, { name: form.name.trim(), address: form.address.trim(), priority: form.priority, status: statusValue, type: form.type, staff: form.staff || "", memo: form.memo.trim(), photos: uploadedPhotos, updatedAt: Date.now() }));
       } else {
-        saveItemDoc(targetId, { name: form.name.trim(), address: form.address.trim(), priority: form.priority, status: statusValue, type: form.type, memo: form.memo.trim(), photos: uploadedPhotos, createdAt: Date.now(), updatedAt: Date.now() });
+        saveItemDoc(targetId, { name: form.name.trim(), address: form.address.trim(), priority: form.priority, status: statusValue, type: form.type, staff: form.staff || "", memo: form.memo.trim(), photos: uploadedPhotos, createdAt: Date.now(), updatedAt: Date.now() });
       }
       setSaving(false);
       setFormOpen(false);
@@ -427,9 +479,9 @@ function PropertyTracker() {
   function exportCsv() {
     var rows = items.filter(function(it){ return selected.has(it.id); });
     var target = rows.length ? rows : filtered;
-    var header = ["物件名", "住所", "優先度", "状態", "区分", "メモ"];
+    var header = ["物件名", "住所", "優先度", "状態", "区分", "担当者", "メモ"];
     function esc(s) { return '"' + String(s == null ? "" : s).replace(/"/g, '""') + '"'; }
-    var csv = [header.map(esc).join(",")].concat(target.map(function(it){ return [it.name, it.address, it.priority, it.status, it.type, it.memo].map(esc).join(","); })).join("\r\n");
+    var csv = [header.map(esc).join(",")].concat(target.map(function(it){ return [it.name, it.address, it.priority, it.status, it.type, it.staff, it.memo].map(esc).join(","); })).join("\r\n");
     var blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
@@ -474,6 +526,7 @@ function PropertyTracker() {
     var priIdx = pickCol(headers, ["優先度"]);
     var statIdx = pickCol(headers, ["現状", "状態"]);
     var typeIdx = pickCol(headers, ["区分"]);
+    var staffIdx = pickCol(headers, ["担当者", "担当"]);
     var memoIdx = pickCol(headers, ["備考", "メモ"]);
     if (addrIdx === -1) { showToast("「住所」列が見つかりません"); return; }
     var existingAddrs = new Set(items.map(function(it){ return it.address.trim(); }));
@@ -492,6 +545,7 @@ function PropertyTracker() {
         priority: (priIdx !== -1 && cols[priIdx]) ? cols[priIdx].trim() : "普通",
         status: (statIdx !== -1 && cols[statIdx]) ? cols[statIdx].trim() : "その他",
         type: (typeIdx !== -1 && cols[typeIdx]) ? cols[typeIdx].trim() : "不明",
+        staff: staffIdx !== -1 ? (cols[staffIdx] || "").trim() : "",
         memo: memoIdx !== -1 ? (cols[memoIdx] || "").trim() : "",
         createdAt: Date.now() - i,
         updatedAt: Date.now() - i,
@@ -510,19 +564,23 @@ function PropertyTracker() {
     showToast(added.length + "件取り込みました" + (skipped ? "（重複" + skipped + "件はスキップ）" : ""));
   }
 
-  if (locked) {
+  if (user === undefined) {
+    return e('div', {style:{minHeight:"100vh", background:"#000"}});
+  }
+  if (!user) {
     return e('div', {style: Object.assign({minHeight:"100vh", display:"flex", flexDirection:"column", background:"#000"}, fontBody)},
       e('div', {style:{position:"relative", overflow:"hidden", height:190, backgroundImage:"url(" + HEADER_IMG + ")", backgroundSize:"cover", backgroundPosition:"center 58%"}},
         e('div', {style:{position:"absolute", left:0, right:0, bottom:0, height:"65%", background:"linear-gradient(180deg, rgba(0,0,0,0) 0%, rgba(0,0,0,0.55) 55%, rgba(0,0,0,0.72) 100%)"}}),
         e('div', {style:{position:"absolute", left:20, right:20, bottom:16}},
           e('div', {style: Object.assign({fontSize:25, fontWeight:700, marginBottom:4, color:"#fff", textShadow:"0 1px 8px rgba(0,0,0,0.7)"}, fontDisplay)}, "新規物件リスト"),
-          e('div', {style:{fontSize:12.5, color:"rgba(255,255,255,0.92)", textShadow:"0 1px 6px rgba(0,0,0,0.7)"}}, "パスワードを入力してください")
+          e('div', {style:{fontSize:12.5, color:"rgba(255,255,255,0.92)", textShadow:"0 1px 6px rgba(0,0,0,0.7)"}}, "ログインしてください")
         )
       ),
-      e('div', {style:{flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:24}},
-        e('input', {type:"password", value:pwInput, onChange:function(ev){ setPwInput(ev.target.value); setPwError(false); }, onKeyDown:function(ev){ if (ev.key==="Enter") submitPassword(); }, style:Object.assign({}, inputStyle, {maxWidth:260, textAlign:"center", letterSpacing:2, color:"#232323"}), placeholder:"パスワード", autoFocus:true}),
-        pwError ? e('div', {style:{color:"#E8631C", fontSize:12.5, marginTop:8}}, "パスワードが違います") : null,
-        e('button', {onClick:submitPassword, style:{marginTop:14, background:"#C9481F", color:"#fff", padding:"10px 28px", borderRadius:4, fontWeight:600}}, "開く")
+      e('div', {style:{flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:24, gap:10}},
+        e('input', {type:"email", value:emailInput, autoComplete:"username", onChange:function(ev){ setEmailInput(ev.target.value); setAuthError(""); }, style:Object.assign({}, inputStyle, {maxWidth:300, color:"#232323"}), placeholder:"メールアドレス", autoFocus:true}),
+        e('input', {type:"password", value:pwInput, autoComplete:"current-password", onChange:function(ev){ setPwInput(ev.target.value); setAuthError(""); }, onKeyDown:function(ev){ if (ev.key==="Enter") submitLogin(); }, style:Object.assign({}, inputStyle, {maxWidth:300, color:"#232323"}), placeholder:"パスワード"}),
+        authError ? e('div', {style:{color:"#E8631C", fontSize:12.5, textAlign:"center"}}, authError) : null,
+        e('button', {onClick:submitLogin, disabled:authBusy, style:{marginTop:6, background:"#C9481F", color:"#fff", padding:"10px 28px", borderRadius:4, fontWeight:600, opacity:authBusy?0.6:1}}, authBusy ? "確認中…" : "ログイン")
       )
     );
   }
@@ -530,6 +588,10 @@ function PropertyTracker() {
   var headerNode = e(F, {key:"header"},
     e('div', {style:{position:"relative", overflow:"hidden", height:150, backgroundImage:"url(" + HEADER_IMG + ")", backgroundSize:"cover", backgroundPosition:"center 58%"}},
       e('div', {style:{position:"absolute", left:0, right:0, bottom:0, height:"60%", background:"linear-gradient(180deg, rgba(0,0,0,0) 0%, rgba(0,0,0,0.5) 60%, rgba(0,0,0,0.68) 100%)"}}),
+      e('div', {style:{position:"absolute", bottom:8, right:8, display:"flex", gap:6, zIndex:2}},
+        isAdmin ? e('button', {onClick:function(){ setAdminOpen(true); }, style:{fontSize:11.5, color:"#fff", background:"rgba(0,0,0,0.55)", border:"1px solid rgba(255,255,255,0.5)", padding:"4px 9px", borderRadius:999}}, "担当者管理") : null,
+        e('button', {onClick:doLogout, style:{fontSize:11.5, color:"#fff", background:"rgba(0,0,0,0.55)", border:"1px solid rgba(255,255,255,0.5)", padding:"4px 9px", borderRadius:999}}, "ログアウト")
+      ),
       e('div', {style:{position:"absolute", left:14, right:14, bottom:10}},
         e('div', {style:Object.assign({fontSize:22, fontWeight:700, letterSpacing:0.5, color:"#fff", textShadow:"0 1px 8px rgba(0,0,0,0.7)"}, fontDisplay)}, "新規物件リスト"),
         e('div', {style:{fontSize:11.5, color:"rgba(255,255,255,0.92)", marginTop:2, textShadow:"0 1px 6px rgba(0,0,0,0.7)"}}, "営業スカウトノート ・ 全" + items.length + "件")
@@ -547,7 +609,7 @@ function PropertyTracker() {
       e(SearchIcon, {size:18, color:"#5B5648"}),
       e('input', {value:query, onChange:function(ev){ setQuery(ev.target.value); }, placeholder:"物件名・住所・状態で検索（スペース区切りでAND）", style:Object.assign({border:"none", background:"transparent", flex:1, fontSize:14, color:"#232323"}, fontBody)}),
       query ? e('button', {onClick:function(){ setQuery(""); }, "aria-label":"検索をクリア"}, e(XIcon,{size:16,color:"#8a8478"})) : null,
-      e('button', {onClick:function(){ setShowFilters(function(s){ return !s; }); }, style:{display:"flex", alignItems:"center", gap:4, color: (showFilters||priorityFilter.size||statusFilter.size) ? "#C9481F":"#5B5648"}, "aria-label":"絞り込み"}, e(FilterIcon,{size:18})),
+      e('button', {onClick:function(){ setShowFilters(function(s){ return !s; }); }, style:{display:"flex", alignItems:"center", gap:4, color: (showFilters||priorityFilter.size||statusFilter.size||staffFilter.size) ? "#C9481F":"#5B5648"}, "aria-label":"絞り込み"}, e(FilterIcon,{size:18})),
       e('button', {onClick:function(){ setImportOpen(true); }, style:{display:"flex", alignItems:"center", gap:4, color:"#5B5648"}, "aria-label":"CSV取込"}, e(UploadIcon,{size:18})),
       e('button', {onClick:function(){ setMapOpen(true); }, style:{display:"flex", alignItems:"center", gap:4, color:"#5B5648"}, "aria-label":"地図で見る"}, e(MapIcon,{size:18}))
     ),
@@ -560,6 +622,13 @@ function PropertyTracker() {
       e('div', {style:{display:"flex", gap:6, flexWrap:"wrap"}},
         STATUS_OPTIONS.filter(function(s){ return s!=="その他"; }).map(function(s){
           return e('button', {key:s, onClick:function(){ toggleStatusFilter(s); }, style:{fontSize:12, padding:"5px 10px", borderRadius:999, border:"1.5px solid #B8B2A3", background: statusFilter.has(s)?"#fff":"transparent", color: statusFilter.has(s)?"#232323":"#C9C4B6"}}, s);
+        })
+      ),
+      e('div', {style:{display:"flex", gap:6, flexWrap:"wrap", alignItems:"center"}},
+        e('span', {style:{fontSize:11.5, color:"#8f897a"}}, "担当"),
+        staffList.map(function(st){ return st.name; }).concat(["__none__"]).map(function(nm){
+          var on = staffFilter.has(nm);
+          return e('button', {key:nm, onClick:function(){ toggleStaffFilter(nm); }, style:{fontSize:12, padding:"5px 10px", borderRadius:999, border:"1.5px solid #3F8F8A", background: on?"#3F8F8A":"transparent", color: on?"#fff":"#7FC4BE"}}, nm==="__none__" ? "未設定" : nm);
         })
       )
     ) : null
@@ -574,10 +643,10 @@ function PropertyTracker() {
     ) : null,
     filtered.map(function(it){
       var pm = priorityMeta(it.priority);
-      return e('div', {key:it.id, style:{background:"#FFFFFF", border:"1px solid #EDEDED", borderRadius:6, padding:12, display:"flex", gap:10, boxShadow:"0 3px 12px rgba(0,0,0,0.55)"}},
+      return e('div', {key:it.id, style:{background:"#FFFFFF", border:"1px solid #EDEDED", borderRadius:6, padding:12, display:"flex", gap:10, boxShadow:"0 2px 6px rgba(0,0,0,0.5)"}},
         e('input', {type:"checkbox", checked:selected.has(it.id), onChange:function(){ toggleSelect(it.id); }, style:{marginTop:4, width:18, height:18, accentColor:"#C9481F"}, "aria-label":"選択"}),
         (it.photos && it.photos.length > 0) ? e('button', {onClick:function(ev){ ev.stopPropagation(); setViewer({photos: it.photos, index: 0}); }, style:{flex:"0 0 auto", position:"relative", width:48, height:48}, "aria-label":"写真を表示"},
-          e('img', {src:it.photos[0], alt:"", style:{width:48, height:48, objectFit:"cover", borderRadius:4, border:"1px solid #C6C0AE"}}),
+          e('img', {src:it.photos[0], alt:"", loading:"lazy", decoding:"async", style:{width:48, height:48, objectFit:"cover", borderRadius:4, border:"1px solid #C6C0AE"}}),
           it.photos.length > 1 ? e('span', {style:{position:"absolute", bottom:-4, right:-4, background:"#232323", color:"#fff", fontSize:9, borderRadius:8, padding:"1px 5px"}}, "+" + (it.photos.length - 1)) : null
         ) : null,
         e('div', {style:{flex:1, minWidth:0, cursor:"pointer"}, onClick:function(){ openEdit(it); }},
@@ -585,6 +654,7 @@ function PropertyTracker() {
             e('span', {style:{fontSize:11, fontWeight:600, color:pm.color, background:pm.bg, padding:"2px 7px", borderRadius:3}}, it.priority),
             e('span', {style:{fontSize:11, color:"#5B5648", border:"1px solid #C6C0AE", padding:"2px 7px", borderRadius:3}}, it.status),
             (it.type && it.type!=="不明") ? e('span', {style:{fontSize:11, color:"#7A5C1E", border:"1px dashed #B8912F", padding:"2px 7px", borderRadius:3}}, it.type) : null,
+            it.staff ? e('span', {style:{fontSize:11, color:"#fff", background:"#3F8F8A", padding:"2px 7px", borderRadius:3}}, "担当: " + it.staff) : null,
             e('span', {style:{marginLeft:"auto"}}, e(PencilIcon,{size:14,color:"#8a8478"}))
           ),
           e('div', {style:Object.assign({fontSize:17, fontWeight:600, lineHeight:1.2, color:"#141414"}, fontDisplay)}, it.name || "（物件名未登録）"),
@@ -681,6 +751,13 @@ function PropertyTracker() {
           return e('button', {key:t, onClick:function(){ setForm(Object.assign({}, form, {type:t})); }, style:{flex:1, padding:"8px 0", borderRadius:4, border:"1.5px solid #B8912F", background: form.type===t?"#B8912F":"transparent", color: form.type===t?"#fff":"#7A5C1E", fontWeight:600, fontSize:13}}, t);
         })
       ),
+      e('label', {style:labelStyle()}, "担当者"),
+      e('div', {style:{display:"flex", gap:6, flexWrap:"wrap", marginBottom:12}},
+        ["" ].concat(staffList.map(function(st){ return st.name; })).concat((form.staff && !staffList.some(function(st){ return st.name === form.staff; })) ? [form.staff] : []).map(function(nm){
+          var on = (form.staff || "") === nm;
+          return e('button', {key:nm||"__none__", onClick:function(){ setForm(Object.assign({}, form, {staff:nm})); }, style:{fontSize:13, padding:"7px 12px", borderRadius:999, border:"1.5px solid #3F8F8A", background: on?"#3F8F8A":"transparent", color: on?"#fff":"#2F6F6A"}}, nm || "未設定");
+        })
+      ),
       e('label', {style:labelStyle()}, "写真"),
       e('div', {style:{display:"flex", flexWrap:"wrap", gap:8, marginBottom:12}},
         (form.photos || []).map(function(src, idx){
@@ -705,6 +782,26 @@ function PropertyTracker() {
     )
   ) : null;
 
+  var adminNode = (adminOpen && isAdmin) ? e('div', {key:"adminmodal", style:{position:"fixed", inset:0, background:"rgba(20,20,20,0.5)", display:"flex", alignItems:"flex-end", zIndex:45}, onClick:function(){ setAdminOpen(false); }},
+    e('div', {style:{background:"#FFFFFF", width:"100%", maxHeight:"88vh", overflowY:"auto", borderRadius:"12px 12px 0 0", padding:18, color:"#232323"}, onClick:function(ev){ ev.stopPropagation(); }},
+      e('div', {style:{display:"flex", alignItems:"center", marginBottom:12}},
+        e('div', {style:Object.assign({fontSize:20, fontWeight:700, color:"#141414"}, fontDisplay)}, "担当者管理"),
+        e('button', {style:{marginLeft:"auto"}, onClick:function(){ setAdminOpen(false); }, "aria-label":"閉じる"}, e(XIcon,{size:20}))
+      ),
+      e('div', {style:{display:"flex", gap:8, marginBottom:14}},
+        e('input', {value:newStaff, onChange:function(ev){ setNewStaff(ev.target.value); }, onKeyDown:function(ev){ if (ev.key==="Enter") addStaff(); }, style:Object.assign({}, inputStyle, {flex:1, marginBottom:0}), placeholder:"担当者名を入力"}),
+        e('button', {onClick:addStaff, style:{background:"#C9481F", color:"#fff", padding:"0 18px", borderRadius:4, fontWeight:600}}, "追加")
+      ),
+      staffList.length === 0 ? e('div', {style:{fontSize:13, color:"#8f897a"}}, "まだ担当者がいません") : null,
+      staffList.map(function(st){
+        return e('div', {key:st.id, style:{display:"flex", alignItems:"center", padding:"10px 0", borderBottom:"1px solid #EDEDED"}},
+          e('span', {style:{fontSize:15, color:"#141414"}}, st.name),
+          e('button', {onClick:function(){ removeStaff(st); }, style:{marginLeft:"auto", color:"#B3261E", display:"flex", alignItems:"center", gap:4, fontSize:13}}, e(TrashIcon,{size:15}), " 削除")
+        );
+      })
+    )
+  ) : null;
+
   var mapNode = mapOpen ? e('div', {key:"mapmodal", style:{position:"fixed", inset:0, background:"#fff", zIndex:70, display:"flex", flexDirection:"column"}},
     e('div', {style:{display:"flex", alignItems:"center", padding:"12px 14px", background:"#1F2933", color:"#fff", gap:10}},
       e('div', {style:Object.assign({fontSize:17, fontWeight:700}, fontDisplay)}, "物件マップ（堺市）"),
@@ -715,7 +812,7 @@ function PropertyTracker() {
   ) : null;
 
   return e('div', {style:Object.assign({background:"#000000", minHeight:"100vh", color:"#F4F1E8"}, fontBody)},
-    headerNode, searchNode, listNode, fabNode, selBarNode, toastNode, viewerNode, importNode, formNode, mapNode
+    headerNode, searchNode, listNode, fabNode, selBarNode, toastNode, viewerNode, importNode, formNode, adminNode, mapNode
   );
 }
 
