@@ -29,7 +29,7 @@
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js";
 import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore.js";
-import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js";
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, sendPasswordResetEmail, signOut } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js";
 import { getStorage, ref as storageRef, uploadString, getDownloadURL } from "https://www.gstatic.com/firebasejs/12.17.1/firebase-storage.js";
 
 var firebaseConfig = {
@@ -45,6 +45,7 @@ var db = getFirestore(fbApp);
 var storage = getStorage(fbApp);
 var auth = getAuth(fbApp);
 var staffCol = collection(db, "staff");
+var membersCol = collection(db, "np_members");
 var propertiesCol = collection(db, "properties");
 
 function uploadPhotos(itemId, photos) {
@@ -206,6 +207,12 @@ function PropertyTracker() {
   var staffListState = useState([]); var staffList = staffListState[0], setStaffList = staffListState[1];
   var staffFilterState = useState(new Set()); var staffFilter = staffFilterState[0], setStaffFilter = staffFilterState[1];
   var adminOpenState = useState(false); var adminOpen = adminOpenState[0], setAdminOpen = adminOpenState[1];
+  var memberExistsState = useState(undefined); var memberExists = memberExistsState[0], setMemberExists = memberExistsState[1];
+  var adminCheckedState = useState(false); var adminChecked = adminCheckedState[0], setAdminChecked = adminCheckedState[1];
+  var memberListState = useState([]); var memberList = memberListState[0], setMemberList = memberListState[1];
+  var authModeState = useState("login"); var authMode = authModeState[0], setAuthMode = authModeState[1];
+  var pw2State = useState(""); var pw2Input = pw2State[0], setPw2Input = pw2State[1];
+  var newMemberState = useState(""); var newMember = newMemberState[0], setNewMember = newMemberState[1];
   var newStaffState = useState(""); var newStaff = newStaffState[0], setNewStaff = newStaffState[1];
   var itemsState = useState([]); var items = itemsState[0], setItems = itemsState[1];
   var queryState = useState(""); var query = queryState[0], setQuery = queryState[1];
@@ -232,7 +239,25 @@ function PropertyTracker() {
   }, []);
 
   useEffect(function() {
-    if (!user) { setItems([]); setStaffList([]); setAdminEmail(""); return; }
+    setMemberExists(undefined); setAdminChecked(false); setAdminEmail("");
+    if (!user || !user.email) return;
+    var unsubs = [];
+    unsubs.push(onSnapshot(doc(db, "np_members", user.email.toLowerCase()), function(snap) {
+      setMemberExists(snap.exists());
+    }, function(err) { setMemberExists(false); }));
+    unsubs.push(onSnapshot(doc(db, "config", "admin"), function(snap) {
+      setAdminEmail(snap.exists() ? String(snap.data().email || "") : "");
+      setAdminChecked(true);
+    }, function(err) { setAdminChecked(true); }));
+    return function() { unsubs.forEach(function(f){ f(); }); };
+  }, [user]);
+
+  var isAdmin = !!(user && user.email && adminEmail && user.email.toLowerCase() === adminEmail.trim().toLowerCase());
+  var allowed = isAdmin || memberExists === true;
+  var checking = !!user && (memberExists === undefined || !adminChecked);
+
+  useEffect(function() {
+    if (!user || !allowed) { setItems([]); setStaffList([]); return; }
     var unsubs = [];
     unsubs.push(onSnapshot(propertiesCol, function(snapshot) {
       var list = [];
@@ -252,13 +277,21 @@ function PropertyTracker() {
       list.sort(function(a, b){ return a.createdAt - b.createdAt; });
       setStaffList(list);
     }, function(err) {}));
-    unsubs.push(onSnapshot(doc(db, "config", "admin"), function(snap) {
-      setAdminEmail(snap.exists() ? String(snap.data().email || "") : "");
-    }, function(err) {}));
     return function() { unsubs.forEach(function(f){ f(); }); };
-  }, [user]);
+  }, [user, allowed]);
 
-  var isAdmin = !!(user && user.email && adminEmail && user.email.toLowerCase() === adminEmail.trim().toLowerCase());
+  useEffect(function() {
+    if (!user || !isAdmin) { setMemberList([]); return; }
+    return onSnapshot(membersCol, function(snapshot) {
+      var list = [];
+      snapshot.forEach(function(docSnap) {
+        var d = docSnap.data();
+        list.push({ id: docSnap.id, email: d.email || docSnap.id, createdAt: d.createdAt || 0 });
+      });
+      list.sort(function(a, b){ return a.createdAt - b.createdAt; });
+      setMemberList(list);
+    }, function(err) {});
+  }, [user, isAdmin]);
 
 
   useEffect(function() {
@@ -346,21 +379,52 @@ function PropertyTracker() {
     setToast(msg);
     setTimeout(function(){ setToast(""); }, 2200);
   }
+  function authErrorText(err) {
+    var c = err && err.code || "";
+    if (c === "auth/network-request-failed") return "通信エラーです。電波を確認してください";
+    if (c === "auth/too-many-requests") return "試行回数が多すぎます。しばらく待ってください";
+    if (c === "auth/invalid-email") return "メールアドレスの形式が正しくありません";
+    if (c === "auth/weak-password") return "パスワードは6文字以上にしてください";
+    if (c === "auth/email-already-in-use") return "このアドレスはすでにパスワード設定済みです。「ログイン」から入ってください";
+    if (c === "auth/operation-not-allowed") return "新規のパスワード作成は現在できません。管理者に連絡してください";
+    return "メールアドレスまたはパスワードが違います";
+  }
   function submitLogin() {
     if (!emailInput.trim() || !pwInput) { setAuthError("メールアドレスとパスワードを入力してください"); return; }
+    if (authMode === "signup") {
+      if (pwInput.length < 6) { setAuthError("パスワードは6文字以上にしてください"); return; }
+      if (pwInput !== pw2Input) { setAuthError("確認用のパスワードが一致しません"); return; }
+    }
     setAuthBusy(true); setAuthError("");
-    signInWithEmailAndPassword(auth, emailInput.trim(), pwInput).then(function() {
-      setAuthBusy(false); setPwInput("");
+    var p = authMode === "signup"
+      ? createUserWithEmailAndPassword(auth, emailInput.trim(), pwInput)
+      : signInWithEmailAndPassword(auth, emailInput.trim(), pwInput);
+    p.then(function() {
+      setAuthBusy(false); setPwInput(""); setPw2Input("");
     }).catch(function(err) {
-      setAuthBusy(false);
-      var c = err && err.code || "";
-      if (c === "auth/network-request-failed") setAuthError("通信エラーです。電波を確認してください");
-      else if (c === "auth/too-many-requests") setAuthError("試行回数が多すぎます。しばらく待ってください");
-      else setAuthError("メールアドレスまたはパスワードが違います");
+      setAuthBusy(false); setAuthError(authErrorText(err));
     });
+  }
+  function resetPassword() {
+    if (!emailInput.trim()) { setAuthError("上にメールアドレスを入力してから押してください"); return; }
+    sendPasswordResetEmail(auth, emailInput.trim()).then(function() {
+      setAuthError("");
+      showToast("再設定のメールを送りました（届かない時は迷惑メールも確認）");
+    }).catch(function(err) { setAuthError(authErrorText(err)); });
+  }
+  function addMember() {
+    var m = newMember.trim().toLowerCase();
+    if (!m || m.indexOf("@") < 1) { showToast("メールアドレスを入力してください"); return; }
+    if (memberList.some(function(x){ return x.id === m; })) { showToast("すでに登録済みです"); return; }
+    setDoc(doc(membersCol, m), { email: m, createdAt: Date.now() }).then(function(){ setNewMember(""); showToast("登録しました"); }).catch(function(){ showToast("登録できませんでした（管理者のみ）"); });
+  }
+  function removeMember(m) {
+    if (!window.confirm("「" + m.email + "」のログイン許可を取り消しますか？")) return;
+    deleteDoc(doc(membersCol, m.id)).catch(function(){ showToast("取り消せませんでした"); });
   }
   function doLogout() {
     if (!window.confirm("ログアウトしますか？")) return;
+    setAuthMode("login");
     signOut(auth);
   }
   function addStaff() {
@@ -564,8 +628,17 @@ function PropertyTracker() {
     showToast(added.length + "件取り込みました" + (skipped ? "（重複" + skipped + "件はスキップ）" : ""));
   }
 
-  if (user === undefined) {
+  if (user === undefined || checking) {
     return e('div', {style:{minHeight:"100vh", background:"#000"}});
+  }
+  if (user && !allowed) {
+    return e('div', {style: Object.assign({minHeight:"100vh", display:"flex", flexDirection:"column", background:"#000", color:"#F4F1E8"}, fontBody)},
+      e('div', {style:{flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:28, gap:14, textAlign:"center"}},
+        e('div', {style:Object.assign({fontSize:20, fontWeight:700}, fontDisplay)}, "まだ登録されていません"),
+        e('div', {style:{fontSize:13.5, lineHeight:1.7, color:"#cfc9b8"}}, user.email + " は、まだこのアプリの利用者として登録されていません。管理者に登録を頼んでください。登録されると、この画面は自動で切り替わります。"),
+        e('button', {onClick:function(){ setAuthMode("login"); signOut(auth); }, style:{marginTop:6, background:"#374151", color:"#fff", padding:"10px 24px", borderRadius:4, fontWeight:600}}, "別のアドレスでログイン")
+      )
+    );
   }
   if (!user) {
     return e('div', {style: Object.assign({minHeight:"100vh", display:"flex", flexDirection:"column", background:"#000"}, fontBody)},
@@ -573,14 +646,18 @@ function PropertyTracker() {
         e('div', {style:{position:"absolute", left:0, right:0, bottom:0, height:"65%", background:"linear-gradient(180deg, rgba(0,0,0,0) 0%, rgba(0,0,0,0.55) 55%, rgba(0,0,0,0.72) 100%)"}}),
         e('div', {style:{position:"absolute", left:20, right:20, bottom:16}},
           e('div', {style: Object.assign({fontSize:25, fontWeight:700, marginBottom:4, color:"#fff", textShadow:"0 1px 8px rgba(0,0,0,0.7)"}, fontDisplay)}, "新規物件リスト"),
-          e('div', {style:{fontSize:12.5, color:"rgba(255,255,255,0.92)", textShadow:"0 1px 6px rgba(0,0,0,0.7)"}}, "ログインしてください")
+          e('div', {style:{fontSize:12.5, color:"rgba(255,255,255,0.92)", textShadow:"0 1px 6px rgba(0,0,0,0.7)"}}, (authMode==="signup" ? "はじめて使う（パスワードを作る）" : "ログインしてください"))
         )
       ),
       e('div', {style:{flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:24, gap:10}},
+        authMode==="signup" ? e('div', {style:{fontSize:12.5, color:"#cfc9b8", maxWidth:300, textAlign:"center", lineHeight:1.6}}, "管理者に登録してもらったメールアドレスで、自分のパスワードを作ります。") : null,
         e('input', {type:"email", value:emailInput, autoComplete:"username", onChange:function(ev){ setEmailInput(ev.target.value); setAuthError(""); }, style:Object.assign({}, inputStyle, {maxWidth:300, color:"#232323"}), placeholder:"メールアドレス", autoFocus:true}),
-        e('input', {type:"password", value:pwInput, autoComplete:"current-password", onChange:function(ev){ setPwInput(ev.target.value); setAuthError(""); }, onKeyDown:function(ev){ if (ev.key==="Enter") submitLogin(); }, style:Object.assign({}, inputStyle, {maxWidth:300, color:"#232323"}), placeholder:"パスワード"}),
-        authError ? e('div', {style:{color:"#E8631C", fontSize:12.5, textAlign:"center"}}, authError) : null,
-        e('button', {onClick:submitLogin, disabled:authBusy, style:{marginTop:6, background:"#C9481F", color:"#fff", padding:"10px 28px", borderRadius:4, fontWeight:600, opacity:authBusy?0.6:1}}, authBusy ? "確認中…" : "ログイン")
+        e('input', {type:"password", value:pwInput, autoComplete: authMode==="signup" ? "new-password" : "current-password", onChange:function(ev){ setPwInput(ev.target.value); setAuthError(""); }, onKeyDown:function(ev){ if (ev.key==="Enter" && authMode==="login") submitLogin(); }, style:Object.assign({}, inputStyle, {maxWidth:300, color:"#232323"}), placeholder: authMode==="signup" ? "パスワード（6文字以上）" : "パスワード"}),
+        authMode==="signup" ? e('input', {type:"password", value:pw2Input, autoComplete:"new-password", onChange:function(ev){ setPw2Input(ev.target.value); setAuthError(""); }, onKeyDown:function(ev){ if (ev.key==="Enter") submitLogin(); }, style:Object.assign({}, inputStyle, {maxWidth:300, color:"#232323"}), placeholder:"パスワード（もう一度）"}) : null,
+        authError ? e('div', {style:{color:"#E8631C", fontSize:12.5, textAlign:"center", maxWidth:300}}, authError) : null,
+        e('button', {onClick:submitLogin, disabled:authBusy, style:{marginTop:6, background:"#C9481F", color:"#fff", padding:"10px 28px", borderRadius:4, fontWeight:600, opacity:authBusy?0.6:1}}, authBusy ? "確認中…" : (authMode==="signup" ? "パスワードを作ってログイン" : "ログイン")),
+        e('button', {onClick:function(){ setAuthMode(authMode==="signup" ? "login" : "signup"); setAuthError(""); setPw2Input(""); }, style:{marginTop:8, color:"#8fb8c9", fontSize:13, textDecoration:"underline"}}, authMode==="signup" ? "ログイン画面にもどる" : "はじめて使う（パスワードを作る）"),
+        authMode==="login" ? e('button', {onClick:resetPassword, style:{color:"#8f897a", fontSize:12.5, textDecoration:"underline"}}, "パスワードを忘れた") : null
       )
     );
   }
@@ -589,7 +666,7 @@ function PropertyTracker() {
     e('div', {style:{position:"relative", overflow:"hidden", height:150, backgroundImage:"url(" + HEADER_IMG + ")", backgroundSize:"cover", backgroundPosition:"center 58%"}},
       e('div', {style:{position:"absolute", left:0, right:0, bottom:0, height:"60%", background:"linear-gradient(180deg, rgba(0,0,0,0) 0%, rgba(0,0,0,0.5) 60%, rgba(0,0,0,0.68) 100%)"}}),
       e('div', {style:{position:"absolute", bottom:8, right:8, display:"flex", gap:6, zIndex:2}},
-        isAdmin ? e('button', {onClick:function(){ setAdminOpen(true); }, style:{fontSize:11.5, color:"#fff", background:"rgba(0,0,0,0.55)", border:"1px solid rgba(255,255,255,0.5)", padding:"4px 9px", borderRadius:999}}, "担当者管理") : null,
+        isAdmin ? e('button', {onClick:function(){ setAdminOpen(true); }, style:{fontSize:11.5, color:"#fff", background:"rgba(0,0,0,0.55)", border:"1px solid rgba(255,255,255,0.5)", padding:"4px 9px", borderRadius:999}}, "管理") : null,
         e('button', {onClick:doLogout, style:{fontSize:11.5, color:"#fff", background:"rgba(0,0,0,0.55)", border:"1px solid rgba(255,255,255,0.5)", padding:"4px 9px", borderRadius:999}}, "ログアウト")
       ),
       e('div', {style:{position:"absolute", left:14, right:14, bottom:10}},
@@ -785,18 +862,32 @@ function PropertyTracker() {
   var adminNode = (adminOpen && isAdmin) ? e('div', {key:"adminmodal", style:{position:"fixed", inset:0, background:"rgba(20,20,20,0.5)", display:"flex", alignItems:"flex-end", zIndex:45}, onClick:function(){ setAdminOpen(false); }},
     e('div', {style:{background:"#FFFFFF", width:"100%", maxHeight:"88vh", overflowY:"auto", borderRadius:"12px 12px 0 0", padding:18, color:"#232323"}, onClick:function(ev){ ev.stopPropagation(); }},
       e('div', {style:{display:"flex", alignItems:"center", marginBottom:12}},
-        e('div', {style:Object.assign({fontSize:20, fontWeight:700, color:"#141414"}, fontDisplay)}, "担当者管理"),
+        e('div', {style:Object.assign({fontSize:20, fontWeight:700, color:"#141414"}, fontDisplay)}, "管理"),
         e('button', {style:{marginLeft:"auto"}, onClick:function(){ setAdminOpen(false); }, "aria-label":"閉じる"}, e(XIcon,{size:20}))
       ),
-      e('div', {style:{display:"flex", gap:8, marginBottom:14}},
+      e('div', {style:{fontSize:14, fontWeight:700, color:"#141414", marginBottom:4}}, "担当者"),
+      e('div', {style:{display:"flex", gap:8, marginBottom:10}},
         e('input', {value:newStaff, onChange:function(ev){ setNewStaff(ev.target.value); }, onKeyDown:function(ev){ if (ev.key==="Enter") addStaff(); }, style:Object.assign({}, inputStyle, {flex:1, marginBottom:0}), placeholder:"担当者名を入力"}),
         e('button', {onClick:addStaff, style:{background:"#C9481F", color:"#fff", padding:"0 18px", borderRadius:4, fontWeight:600}}, "追加")
       ),
-      staffList.length === 0 ? e('div', {style:{fontSize:13, color:"#8f897a"}}, "まだ担当者がいません") : null,
+      staffList.length === 0 ? e('div', {style:{fontSize:13, color:"#8f897a", marginBottom:10}}, "まだ担当者がいません") : null,
       staffList.map(function(st){
-        return e('div', {key:st.id, style:{display:"flex", alignItems:"center", padding:"10px 0", borderBottom:"1px solid #EDEDED"}},
+        return e('div', {key:st.id, style:{display:"flex", alignItems:"center", padding:"9px 0", borderBottom:"1px solid #EDEDED"}},
           e('span', {style:{fontSize:15, color:"#141414"}}, st.name),
           e('button', {onClick:function(){ removeStaff(st); }, style:{marginLeft:"auto", color:"#B3261E", display:"flex", alignItems:"center", gap:4, fontSize:13}}, e(TrashIcon,{size:15}), " 削除")
+        );
+      }),
+      e('div', {style:{fontSize:14, fontWeight:700, color:"#141414", margin:"22px 0 4px"}}, "ログインできる人"),
+      e('div', {style:{fontSize:12, color:"#6b665a", lineHeight:1.6, marginBottom:8}}, "ここに登録したメールアドレスの人だけが使えます。登録したら、本人に「はじめて使う」から自分でパスワードを作ってもらいます。（あなた自身は登録不要です）"),
+      e('div', {style:{display:"flex", gap:8, marginBottom:10}},
+        e('input', {type:"email", value:newMember, onChange:function(ev){ setNewMember(ev.target.value); }, onKeyDown:function(ev){ if (ev.key==="Enter") addMember(); }, style:Object.assign({}, inputStyle, {flex:1, marginBottom:0}), placeholder:"メールアドレス"}),
+        e('button', {onClick:addMember, style:{background:"#C9481F", color:"#fff", padding:"0 18px", borderRadius:4, fontWeight:600}}, "登録")
+      ),
+      memberList.length === 0 ? e('div', {style:{fontSize:13, color:"#8f897a"}}, "まだ登録された人がいません") : null,
+      memberList.map(function(m){
+        return e('div', {key:m.id, style:{display:"flex", alignItems:"center", padding:"9px 0", borderBottom:"1px solid #EDEDED"}},
+          e('span', {style:{fontSize:14, color:"#141414", wordBreak:"break-all"}}, m.email),
+          e('button', {onClick:function(){ removeMember(m); }, style:{marginLeft:"auto", color:"#B3261E", display:"flex", alignItems:"center", gap:4, fontSize:13, flex:"0 0 auto"}}, e(TrashIcon,{size:15}), " 取消")
         );
       })
     )
