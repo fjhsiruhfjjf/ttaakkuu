@@ -191,6 +191,10 @@
   .optable th,.optable td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:right}
   .optable th:first-child,.optable td:first-child{text-align:left}
   .optable th{color:var(--sub);background:var(--surface2)}
+  /* iPhoneで連続タップした時の拡大を防ぐ／入力欄をタップした時の自動拡大を防ぐ */
+  html,body{touch-action:manipulation}
+  button,a,input,select,textarea,label,.card{touch-action:manipulation}
+  input,select,textarea{font-size:max(16px,1em)}
 </style>
 </head>
 <body>
