@@ -593,7 +593,32 @@ async function renderSearchList() {
   list.querySelectorAll('[data-edit]').forEach(el => el.onclick = () => openCustomerModal(customers.find(c => c.id === el.dataset.edit), null, null));
 }
 
+/* ==== 回収時間（ドライバーが記録したものを表示） ==== */
+const edTimes = {};
+function loadEdTimes(courseId) {
+  edTimes[courseId] = edTimes[courseId] || { loading: true, times: {} };
+  getWithRetry(db.collection('cm_courses').doc('_ct_' + courseId), 2)
+    .then(d => { edTimes[courseId] = { times: d.exists ? (d.data().times || {}) : {} }; if (activeCourseId === courseId) renderContent(); })
+    .catch(e => { console.error('回収時間の読み込みに失敗', e); edTimes[courseId] = { times: {} }; });
+}
+function edTimeSummary(courseId, cid, days) {
+  const ORDER = ['月', '火', '水', '木', '金', '土', '日'];
+  const t = (edTimes[courseId] || {}).times || {};
+  const rnd = v => { const [h, m] = v.split(':').map(Number); let mm = Math.round(m / 10) * 10, hh = h; if (mm === 60) { hh++; mm = 0; } return `${hh}:${String(mm).padStart(2, '0')}`; };
+  const ds = (days && days.length ? days : ORDER).slice().sort((a, b) => ORDER.indexOf(a) - ORDER.indexOf(b));
+  const vals = ds.map(d => ({ d, v: t[`${cid}__${d}`] ? rnd(t[`${cid}__${d}`].t) : null }));
+  if (!vals.some(x => x.v)) return '';
+  const missing = vals.some(x => !x.v);
+  const groups = [];
+  vals.filter(x => x.v).forEach(x => { const g = groups[groups.length - 1]; if (g && g.v === x.v) g.days.push(x.d); else groups.push({ v: x.v, days: [x.d] }); });
+  return groups.map(g => {
+    const consecutive = g.days.every((d, i) => i === 0 || ORDER.indexOf(d) === ORDER.indexOf(g.days[i - 1]) + 1);
+    return `${consecutive && g.days.length >= 3 ? g.days[0] + '〜' + g.days[g.days.length - 1] : g.days.join('・')} ${g.v}頃`;
+  }).join('／') + (missing ? '（ほかの曜日は未記録）' : '');
+}
+
 function renderCourseList(course) {
+  if (!edTimes[course.id]) loadEdTimes(course.id);
   let items = customers.filter(c => findAssignment(c, mode, course.id));
   items.sort((a, b) => (findAssignment(a, mode, course.id).order ?? 0) - (findAssignment(b, mode, course.id).order ?? 0));
   const filtered = dayFilter !== 'all' ? items.filter(c => { const a = findAssignment(c, mode, course.id); return a.days && a.days.includes(dayFilter); }) : items;
@@ -604,6 +629,7 @@ function renderCourseList(course) {
   list.innerHTML = filtered.map((cu, i) => {
     const it = withLegacyFallback(cu, findAssignment(cu, mode, course.id));
     const al = alertLinesHtml(cu.id, mode);
+    const tsum = edTimeSummary(course.id, cu.id, it.days);
     return `
     <div class="card${al ? ' alert' : ''}">
       ${readOnly ? `<div class="num">${i+1}</div>` : `
@@ -620,6 +646,7 @@ function renderCourseList(course) {
           ${it.days && it.days.length ? `<span class="badge days">${it.days.join('')}</span>` : ''}
         </div>
         ${it.memo ? `<div class="addr">📝 ${esc(it.memo)}</div>` : ''}
+        ${tsum ? `<div class="addr">🕘 ${esc(tsum)}</div>` : ''}
         ${al}
         ${customerTypeBadges(cu, mode)}
       </div>
@@ -1302,6 +1329,7 @@ async function migrateIfNeeded() {
 document.getElementById('reloadBtn').onclick = async () => {
   const keepMode = mode, keepCourse = activeCourseId;
   loadedCourseIds = new Set(); allCustomersLoaded = false; customers = [];
+  Object.keys(edTimes).forEach(k => delete edTimes[k]);
   await initialLoad();
   mode = keepMode; activeCourseId = courses.some(c => c.id === keepCourse) ? keepCourse : null;
   renderTopTabs(); renderCourseTabs();

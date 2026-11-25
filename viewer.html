@@ -143,6 +143,25 @@
   html,body{touch-action:manipulation}
   button,a,input,select,textarea,label,.card{touch-action:manipulation}
   input,select,textarea{font-size:max(16px,1em)}
+  /* 回収時間の記録 */
+  .timebar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:2px 0 8px}
+  .timebar #recStart{border:1px solid var(--blue);background:var(--days-bg);color:var(--days-fg);border-radius:10px;padding:9px 12px;font-weight:900;font-size:13.5px;font-family:inherit}
+  .wdstats{display:flex;gap:4px;flex-wrap:wrap}
+  .wdst{font-size:11.5px;font-weight:800;border-radius:6px;padding:2px 6px;background:var(--surface1);color:var(--sub)}
+  .wdst.all{background:var(--key-bg);color:var(--key-fg)}
+  .wdst.some{background:var(--days-bg);color:var(--days-fg)}
+  .timebar.on{justify-content:space-between;border:2px solid var(--blue);background:var(--days-bg);border-radius:12px;padding:10px 12px;position:sticky;top:8px;z-index:5}
+  .timebar.on .tb-l{min-width:0;display:flex;flex-direction:column;color:var(--days-fg)}
+  .timebar.on small{font-size:12px;font-weight:700}
+  .timebar.on #recEnd{border:none;background:var(--blue);color:#fff;border-radius:9px;padding:9px 12px;font-weight:900;font-size:13px;font-family:inherit}
+  .card.rec{border:2px solid var(--blue);background:var(--days-bg)}
+  .card.recdone{border-color:var(--teal)}
+  .recline{margin-top:6px;font-size:13px;font-weight:900;color:var(--days-fg)}
+  .recdone{margin-top:6px;font-size:13px;font-weight:800;color:var(--key-fg);display:flex;align-items:center;gap:10px}
+  .recundo{border:1px solid var(--border2);border-radius:7px;padding:2px 8px;font-size:12px;color:var(--sub);cursor:pointer}
+  .recbtn{display:block;width:100%;margin-top:8px;border:none;border-radius:10px;padding:10px;font-size:14px;font-weight:900;background:var(--blue);color:#fff;font-family:inherit}
+  .detailbtn{flex:0 0 auto;align-self:center;border:1px solid var(--border2);background:var(--card);color:var(--text);border-radius:9px;padding:8px 10px;font-size:12.5px;font-weight:800;font-family:inherit}
+  .timeinfo{font-size:12px;color:var(--sub);margin-top:3px;white-space:normal;line-height:1.5}
 </style>
 </head>
 <body>
@@ -166,6 +185,7 @@
 </header>
 <main>
   <input class="search" id="search" placeholder="得意先名・住所で検索">
+  <div id="timeBar"></div>
   <div class="meta" id="meta"></div>
   <div id="list"></div>
 </main>
@@ -421,6 +441,7 @@ async function openActiveCourse() {
     showListLoading();
     try { await ensureCourseLoaded(activeCourseId); } catch (e) { console.error(e); showListError('openActiveCourse()'); return; }
   }
+  if (mode !== 'search' && activeCourseId) await ensureTimes(activeCourseId);
   renderList();
 }
 
@@ -497,6 +518,8 @@ function customerTypeBadges(cu, excludeType) {
 async function renderList() {
   const q = document.getElementById('search').value.trim().toLowerCase();
   const list = document.getElementById('list');
+  if (recMode && (mode === 'search' || recCourseId !== activeCourseId)) recMode = false;
+  renderTimeBar(null, []);
 
   if (mode === 'search') {
     if (isLimited()) { list.innerHTML = ''; return; }
@@ -515,11 +538,14 @@ async function renderList() {
         <div class="info">
           <div class="name">${esc(cu.name)}</div>
           ${cu.address ? `<div class="addr">${esc(cu.address)}</div>` : ''}
+          ${timeLinesFor(cu).length ? `<div class="timeinfo">🕘 ${esc(timeLinesFor(cu).join('　'))}</div>` : ''}
           ${customerTypeBadges(cu)}
         </div>
         ${cu.address ? `<a class="maplink" href="${mapsUrl(cu.address)}" target="_blank" onclick="event.stopPropagation()">📍</a>` : ''}
       </div>
     `).join('');
+    const need = [...new Set(results.slice(0, 40).flatMap(cu => WASTE_TYPES.flatMap(w => getAssignments(cu, w.key).map(a => a.courseId))))].filter(id => id && !timesCache[id]);
+    if (need.length) Promise.all(need.map(id => ensureTimes(id))).then(() => { if (mode === 'search' && document.getElementById('search').value.trim().toLowerCase() === q) renderList(); });
     return;
   }
 
@@ -532,6 +558,7 @@ async function renderList() {
   if (!course) { document.getElementById('meta').textContent = ''; list.innerHTML = `<div class="empty">この品目にはまだコースが登録されていません。</div>`; return; }
   let items = customers.filter(c => findAssignment(c, mode, course.id));
   items.sort((a, b) => (findAssignment(a, mode, course.id).order ?? 0) - (findAssignment(b, mode, course.id).order ?? 0));
+  renderTimeBar(course, items);
   if (dayFilter !== 'all') items = items.filter(c => { const a = findAssignment(c, mode, course.id); return a.days && a.days.includes(dayFilter); });
   if (q) items = items.filter(c => matchesQuery(c, q));
   const wRemain = weighRemaining(items);
@@ -540,8 +567,9 @@ async function renderList() {
   list.innerHTML = items.map((cu, i) => {
     const it = withLegacyFallback(cu, findAssignment(cu, mode, course.id));
     const op = cardOps(cu);
+    const tm = cardTime(cu, course, it);
     return `
-    <div class="card${op.cls}" onclick="openSheet('${cu.id}')">
+    <div class="card${op.cls}${tm.cls}" onclick="cardTap('${cu.id}')">
       <div class="num">${i + 1}</div>
       ${cu.hasPhoto || (cu.photos && cu.photos.length) ? `<div class="thumbwrap"><img class="thumb" src="${photoUrlFor(cu.id, customerPhotoIds(cu)[0])}" onclick="event.stopPropagation();openLightbox('${cu.id}')" onerror="this.parentElement.remove()">${customerPhotoIds(cu).length>1?`<span class="thumbcount">${customerPhotoIds(cu).length}</span>`:''}</div>` : ''}
       <div class="info">
@@ -551,10 +579,12 @@ async function renderList() {
           ${it.days && it.days.length ? `<span class="badge days">${it.days.join('')}</span>` : ''}
         </div>
         ${it.memo ? `<div class="addr">📝 ${esc(it.memo)}</div>` : ''}
+        ${tm.html}
         ${op.html}
         ${customerTypeBadges(cu, mode)}
       </div>
-      ${cu.address ? `<input type="checkbox" class="routecheck" data-route="${cu.id}" ${selectedIds.has(cu.id) ? 'checked' : ''}>` : ''}
+      ${tm.detail}
+      ${cu.address && !tm.detail ? `<input type="checkbox" class="routecheck" data-route="${cu.id}" ${selectedIds.has(cu.id) ? 'checked' : ''}>` : ''}
       ${cu.address ? `<a class="maplink" href="${mapsUrl(cu.address)}" target="_blank" onclick="event.stopPropagation()">📍</a>` : ''}
     </div>`;
   }).join('');
@@ -599,6 +629,7 @@ function openSheet(custId) {
       return `<div class="typeblock">
         <div class="th">${w.icon} ${w.label}</div>
         <div class="tv">${esc(courseLabel(course))}${it.days && it.days.length ? '　回収曜日: ' + it.days.join('・') : ''}</div>
+        ${timeSummary(it.courseId, cu.id, it.days) ? `<div class="tv">🕘 回収時間の目安：${esc(timeSummary(it.courseId, cu.id, it.days))}</div>` : ''}
         ${it.hasKey ? `<div class="tv">🔑 ${esc(it.keyNumber || '鍵あり')}</div>` : ''}
         ${it.memo ? `<div class="tv">📝 ${esc(it.memo)}</div>` : ''}
       </div>`;
@@ -611,6 +642,9 @@ function openSheet(custId) {
     ${cu.address ? `<a class="bigmap" href="${mapsUrl(cu.address)}" target="_blank">📍 Googleマップで開く</a>` : ''}
   `;
   document.getElementById('overlay').classList.add('show');
+  ensureTimesForCustomer(cu).then(changed => {
+    if (changed && document.getElementById('overlay').classList.contains('show') && document.getElementById('sheetName').textContent === cu.name) openSheet(custId);
+  });
 }
 function closeSheet() { document.getElementById('overlay').classList.remove('show'); }
 document.getElementById('overlay').addEventListener('click', e => { if (e.target.id === 'overlay') closeSheet(); });
@@ -809,8 +843,149 @@ function drawWeigh() {
 }
 document.getElementById('wOverlay').addEventListener('click', e => { if (e.target.id === 'wOverlay') closeWeigh(); });
 
+/* ==== 回収時間の記録 ==== */
+// 保存場所：cm_courses/_ct_{コースID} … { times: { 得意先ID__曜日: { t:'09:12', date:'YYYY-MM-DD', by } } }
+const timesCache = {};       // コースID → times
+const timesFetchedAt = {};
+const undoStash = {};
+let recMode = false, recCourseId = null, recPrevFilter = 'all';
+const WD_ORDER = ['月', '火', '水', '木', '金', '土', '日'];
+const timeDocId = cid => '_ct_' + cid;
+const nowHM = () => { const d = new Date(); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+async function ensureTimes(courseId, force) {
+  if (!courseId) return {};
+  if (timesCache[courseId] && !force) return timesCache[courseId];
+  try {
+    const d = await getWithRetry(db.collection('cm_courses').doc(timeDocId(courseId)), 2);
+    timesCache[courseId] = d.exists ? (d.data().times || {}) : {};
+    timesFetchedAt[courseId] = Date.now();
+  } catch (e) { console.error('回収時間の読み込みに失敗', e); timesCache[courseId] = timesCache[courseId] || {}; }
+  return timesCache[courseId];
+}
+const courseTimes = courseId => timesCache[courseId] || {};
+const recFor = (courseId, cid, wd) => courseTimes(courseId)[`${cid}__${wd}`] || null;
+const courseHasAnyTime = courseId => Object.keys(courseTimes(courseId)).length > 0;
+const customerHasAnyTime = (courseId, cid) => Object.keys(courseTimes(courseId)).some(k => k.startsWith(cid + '__'));
+function roundT(t) { const [h, m] = t.split(':').map(Number); let mm = Math.round(m / 10) * 10, hh = h; if (mm === 60) { hh++; mm = 0; } return `${hh}:${pad2(mm)}`; }
+// 例：「月 9:10頃／火〜土 9:40頃」
+function timeSummary(courseId, cid, days) {
+  const ds = (days && days.length ? days : WD_ORDER).slice().sort((a, b) => WD_ORDER.indexOf(a) - WD_ORDER.indexOf(b));
+  const vals = ds.map(d => { const r = recFor(courseId, cid, d); return { d, v: r ? roundT(r.t) : null }; });
+  if (!vals.some(x => x.v)) return '';
+  const missing = vals.some(x => !x.v);
+  const groups = [];
+  vals.filter(x => x.v).forEach(x => { const g = groups[groups.length - 1]; if (g && g.v === x.v) g.days.push(x.d); else groups.push({ v: x.v, days: [x.d] }); });
+  return groups.map(g => {
+    const consecutive = g.days.every((d, i) => i === 0 || WD_ORDER.indexOf(d) === WD_ORDER.indexOf(g.days[i - 1]) + 1);
+    const lab = consecutive && g.days.length >= 3 ? `${g.days[0]}〜${g.days[g.days.length - 1]}` : g.days.join('・');
+    return `${lab} ${g.v}頃`;
+  }).join('／') + (missing ? '（ほかの曜日は未記録）' : '');
+}
+// 一覧カードの状態
+function cardTime(cu, course, it) {
+  const wd = todayChar(), today = todayStr();
+  const scheduled = it.days && it.days.includes(wd);
+  if (recMode && recCourseId === course.id) {
+    const detail = `<button class="detailbtn" onclick="event.stopPropagation();openSheet('${cu.id}')">詳細</button>`;
+    if (!scheduled) return { cls: '', html: '', detail };
+    const r = recFor(course.id, cu.id, wd);
+    if (r && r.date === today) return { cls: ' recdone', html: `<div class="recdone">🕘 ${esc(r.t)} 記録済<span class="recundo" onclick="event.stopPropagation();undoTime('${cu.id}')">取消</span></div>`, detail };
+    return { cls: ' rec', html: `<div class="recline">⏱ タップして回収時間を記録</div>`, detail };
+  }
+  // 記録モード以外：記録が始まっているコースで、まだ一度も記録のない得意先（新しく増えた得意先）
+  if (scheduled && courseHasAnyTime(course.id) && !customerHasAnyTime(course.id, cu.id)) {
+    return { cls: ' rec', html: `<button class="recbtn" onclick="event.stopPropagation();stampTime('${cu.id}')">⏱ 新しい得意先：回収時間を記録</button>`, detail: '' };
+  }
+  return { cls: '', html: '', detail: '' };
+}
+function cardTap(cid) {
+  if (recMode && mode !== 'search' && recCourseId === activeCourseId) {
+    const cu = customers.find(c => c.id === cid);
+    const a = cu && findAssignment(cu, mode, activeCourseId);
+    const wd = todayChar();
+    if (a && a.days && a.days.includes(wd)) {
+      const r = recFor(activeCourseId, cid, wd);
+      if (!(r && r.date === todayStr())) { stampTime(cid); return; }
+    }
+  }
+  openSheet(cid);
+}
+async function stampTime(cid) {
+  const courseId = activeCourseId, course = courses.find(c => c.id === courseId), wd = todayChar();
+  const key = `${cid}__${wd}`;
+  const val = { t: nowHM(), date: todayStr(), by: course ? (course.group || course.name || '') : '' };
+  const times = timesCache[courseId] = timesCache[courseId] || {};
+  undoStash[courseId + '|' + key] = times[key] || null;
+  times[key] = val;
+  renderList();
+  try {
+    await db.collection('cm_courses').doc(timeDocId(courseId)).set({ courseId, times: { [key]: val } }, { merge: true });
+    toast(`🕘 ${val.t} で記録しました`);
+  } catch (e) {
+    console.error(e);
+    const prev = undoStash[courseId + '|' + key]; if (prev) times[key] = prev; else delete times[key];
+    renderList(); toast('記録できませんでした。電波の良い場所でもう一度押してください');
+  }
+}
+async function undoTime(cid) {
+  const courseId = activeCourseId, wd = todayChar(), key = `${cid}__${wd}`;
+  const times = timesCache[courseId] = timesCache[courseId] || {};
+  const prev = undoStash[courseId + '|' + key] || null, cur = times[key];
+  if (prev) times[key] = prev; else delete times[key];
+  renderList();
+  try {
+    await db.collection('cm_courses').doc(timeDocId(courseId)).set({ times: { [key]: prev ? prev : firebase.firestore.FieldValue.delete() } }, { merge: true });
+    toast('取り消しました');
+  } catch (e) { console.error(e); if (cur) times[key] = cur; renderList(); toast('取り消せませんでした。もう一度お試しください'); }
+}
+// 一覧の上の記録バー
+function renderTimeBar(course, allItems) {
+  const bar = document.getElementById('timeBar');
+  if (!course || mode === 'search' || !canView(course.id)) { bar.innerHTML = ''; return; }
+  const wd = todayChar(), today = todayStr();
+  if (recMode && recCourseId === course.id) {
+    const todays = allItems.filter(cu => { const a = findAssignment(cu, mode, course.id); return a && a.days && a.days.includes(wd); });
+    const remain = todays.filter(cu => { const r = recFor(course.id, cu.id, wd); return !(r && r.date === today); }).length;
+    bar.innerHTML = `<div class="timebar on"><div class="tb-l"><b>⏱ 回収時間を記録中（${wd}曜日）</b><small>回収したら得意先を押してください　残り${remain}件</small></div><button id="recEnd">記録を終了</button></div>`;
+    document.getElementById('recEnd').onclick = () => { recMode = false; dayFilter = recPrevFilter; renderDayTabs(); renderList(); };
+  } else {
+    // 曜日ごとの記録状況（そのコースでその曜日に回る得意先のうち、何件記録があるか）
+    const stat = WD_ORDER.map(d => {
+      const its = allItems.filter(cu => { const a = findAssignment(cu, mode, course.id); return a && a.days && a.days.includes(d); });
+      if (!its.length) return '';
+      const n = its.filter(cu => recFor(course.id, cu.id, d)).length;
+      return `<span class="wdst ${n === its.length ? 'all' : n ? 'some' : ''}">${d}${n === its.length ? '✓' : n ? '△' : '–'}</span>`;
+    }).join('');
+    bar.innerHTML = `<div class="timebar"><button id="recStart">⏱ 回収時間を記録する</button><div class="wdstats">${stat}</div></div>`;
+    document.getElementById('recStart').onclick = async () => {
+      await ensureTimes(course.id);
+      recMode = true; recCourseId = course.id; recPrevFilter = dayFilter; dayFilter = wd;
+      renderDayTabs(); renderList();
+      window.scrollTo({ top: 0 });
+    };
+  }
+}
+// 詳細シート用：得意先の全コースの回収時間を読み込んでから表示し直す
+async function ensureTimesForCustomer(cu) {
+  const ids = [...new Set(WASTE_TYPES.flatMap(w => getAssignments(cu, w.key).map(a => a.courseId)))].filter(id => !timesCache[id]);
+  if (!ids.length) return false;
+  await Promise.all(ids.map(id => ensureTimes(id)));
+  return true;
+}
+function timeLinesFor(cu) {
+  return WASTE_TYPES.flatMap(w => getAssignments(cu, w.key).map(a => {
+    const s = timeSummary(a.courseId, cu.id, a.days); return s ? `${w.icon} ${s}` : '';
+  })).filter(Boolean);
+}
+// 開いたままのアプリに戻った時、10分以上たっていれば回収時間も最新に
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState !== 'visible' || !activeCourseId || recMode) return;
+  if (Date.now() - (timesFetchedAt[activeCourseId] || 0) > 10 * 60 * 1000) { await ensureTimes(activeCourseId, true); renderList(); }
+});
+
 document.getElementById('reloadBtn').onclick = async () => {
   const btn = document.getElementById('reloadBtn'); btn.disabled = true;
+  Object.keys(timesCache).forEach(k => delete timesCache[k]);
   await load(true);
   btn.disabled = false;
 };
