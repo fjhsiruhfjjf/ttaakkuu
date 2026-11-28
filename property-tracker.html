@@ -239,6 +239,8 @@ function PropertyTracker() {
   var importOpenState = useState(false); var importOpen = importOpenState[0], setImportOpen = importOpenState[1];
   var importTextState = useState(""); var importText = importTextState[0], setImportText = importTextState[1];
   var savingState = useState(false); var saving = savingState[0], setSaving = savingState[1];
+  var sortModeState = useState(function(){ var v = loadJson("np_sort"); return (v === "created" || v === "updated") ? v : "priority"; }); var sortMode = sortModeState[0], setSortModeRaw = sortModeState[1];
+  function setSortMode(v) { setSortModeRaw(v); saveJson("np_sort", v); }
   var hideClosedState = useState(false); var hideClosed = hideClosedState[0], setHideClosed = hideClosedState[1];
   var nearOnState = useState(false); var nearOn = nearOnState[0], setNearOn = nearOnState[1];
   var radiusState = useState(10); var radiusKm = radiusState[0], setRadiusKm = radiusState[1];
@@ -514,6 +516,8 @@ function PropertyTracker() {
       var ra = a.result === "won" ? 1 : a.result === "lost" ? 2 : 0;
       var rb = b.result === "won" ? 1 : b.result === "lost" ? 2 : 0;
       if (ra !== rb) return ra - rb;
+      if (sortMode === "created") return (b.createdAt || 0) - (a.createdAt || 0);
+      if (sortMode === "updated") return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
       if (nearOn && myPos && typeof a.lat === "number" && typeof b.lat === "number") {
         return distKm(myPos.lat, myPos.lng, a.lat, a.lng) - distKm(myPos.lat, myPos.lng, b.lat, b.lng);
       }
@@ -523,7 +527,7 @@ function PropertyTracker() {
       if (oa !== ob) return oa - ob;
       return (b.createdAt || 0) - (a.createdAt || 0);
     });
-  }, [items, query, priorityFilter, statusFilter, staffFilter, nearOn, myPos, radiusKm, hideClosed]);
+  }, [items, query, priorityFilter, statusFilter, staffFilter, nearOn, myPos, radiusKm, hideClosed, sortMode]);
 
   function togglePriorityFilter(key) {
     var next = new Set(priorityFilter);
@@ -758,6 +762,13 @@ function PropertyTracker() {
     ),
     showFilters ? e('div', {style:{marginTop:10, display:"flex", flexDirection:"column", gap:8}},
       e('div', {style:{display:"flex", gap:6, flexWrap:"wrap", alignItems:"center"}},
+        e('span', {style:{fontSize:11.5, color:"#8f897a"}}, "並び順"),
+        [["priority", "優先度順"], ["created", "登録が新しい順"], ["updated", "更新が新しい順"]].map(function(o){
+          var on = sortMode === o[0];
+          return e('button', {key:o[0], onClick:function(){ setSortMode(o[0]); }, style:{fontSize:12, padding:"5px 10px", borderRadius:999, border:"1.5px solid #B8B2A3", background: on?"#fff":"transparent", color: on?"#232323":"#C9C4B6"}}, o[1]);
+        })
+      ),
+      e('div', {style:{display:"flex", gap:6, flexWrap:"wrap", alignItems:"center"}},
         e('button', {onClick:toggleNear, style:{fontSize:12, padding:"5px 12px", borderRadius:999, border:"1.5px solid #E8631C", background: nearOn?"#E8631C":"transparent", color: nearOn?"#fff":"#F3B58F", fontWeight:600}}, locBusy ? "現在地を確認中…" : "📍 現在地の近く"),
         nearOn ? [3,5,10,20].map(function(r){
           return e('button', {key:r, onClick:function(){ setRadiusKm(r); }, style:{fontSize:12, padding:"5px 10px", borderRadius:999, border:"1.5px solid #B8B2A3", background: radiusKm===r?"#fff":"transparent", color: radiusKm===r?"#232323":"#C9C4B6"}}, r + "km");
@@ -766,7 +777,7 @@ function PropertyTracker() {
         nearOn && myPos ? e('button', {onClick:function(){ locate(); }, style:{fontSize:12, color:"#8fb8c9", textDecoration:"underline", marginLeft:4}}, "現在地を更新") : null
       ),
       (nearOn && myPos) ? e('div', {style:{fontSize:11.5, color:"#8f897a"}},
-        "近い順に表示" + (items.filter(function(it){ return typeof it.lat !== "number"; }).length ? "　※位置が未確認の物件 " + items.filter(function(it){ return typeof it.lat !== "number"; }).length + "件は対象外（確認中: " + (geoStatus || "待機") + "）" : "")
+        (sortMode === "priority" ? "近い順に表示" : "並び順の設定を優先して表示") + (items.filter(function(it){ return typeof it.lat !== "number"; }).length ? "　※位置が未確認の物件 " + items.filter(function(it){ return typeof it.lat !== "number"; }).length + "件は対象外（確認中: " + (geoStatus || "待機") + "）" : "")
       ) : null,
       e('div', {style:{display:"flex", gap:6, flexWrap:"wrap"}},
         PRIORITIES.map(function(p){
@@ -819,7 +830,7 @@ function PropertyTracker() {
             e('span', {style:{textDecoration:"underline", textUnderlineOffset:2}}, it.address)
           ),
           it.memo ? e('div', {style:{fontSize:12.5, color:"#6b665a", marginTop:5, display:"-webkit-box", WebkitLineClamp:2, WebkitBoxOrient:"vertical", overflow:"hidden"}}, it.memo) : null,
-          (it.updatedAt || it.createdAt) ? e('div', {style:{fontSize:10.5, color:"#a8a290", marginTop:5}}, "更新: " + formatDate(it.updatedAt || it.createdAt) + ((nearOn && myPos && typeof it.lat === "number") ? "　現在地から約 " + distKm(myPos.lat, myPos.lng, it.lat, it.lng).toFixed(1) + "km" + (it.approxLoc ? "（概算）" : "") : "")) : null,
+          (it.updatedAt || it.createdAt) ? e('div', {style:{fontSize:10.5, color:"#a8a290", marginTop:5}}, (sortMode === "created" && it.createdAt ? "登録: " + formatDate(it.createdAt) + "　" : "") + "更新: " + formatDate(it.updatedAt || it.createdAt) + ((nearOn && myPos && typeof it.lat === "number") ? "　現在地から約 " + distKm(myPos.lat, myPos.lng, it.lat, it.lng).toFixed(1) + "km" + (it.approxLoc ? "（概算）" : "") : "")) : null,
           e('div', {style:{display:"flex", gap:8, marginTop:8}},
             e('button', {onClick:function(ev){ ev.stopPropagation(); setResult(it, "won"); }, style:{fontSize:12, fontWeight:600, padding:"5px 16px", borderRadius:999, border:"1.5px solid #2E8B4A", background: it.result==="won"?"#2E8B4A":"transparent", color: it.result==="won"?"#fff":"#2E8B4A"}}, "受注"),
             e('button', {onClick:function(ev){ ev.stopPropagation(); setResult(it, "lost"); }, style:{fontSize:12, fontWeight:600, padding:"5px 16px", borderRadius:999, border:"1.5px solid #6b665a", background: it.result==="lost"?"#6b665a":"transparent", color: it.result==="lost"?"#fff":"#6b665a"}}, "失注")
